@@ -18,6 +18,9 @@ The target device sees the physical mouse at the Linux/Android input layer, but 
   and later frames extend that same stroke using `StrokeDescription.continueStroke()`.
 - Left-button release ends the touch stroke.
 - No gesture is intentionally injected outside `com.cdprojektred.gwent`.
+- Foreground verification follows the input-focused GWENT accessibility window, so a
+  non-focusable heads-up notification does not latch the bridge off. A focused notification
+  shade or another application still disables capture and injection immediately.
 - No root, internet permission, analytics, right-click mapping, or scroll mapping.
 - Input capture fails closed unless Shizuku reports the non-root shell identity (UID 2000).
 - The left button is recognized by canonical numeric code `0x110`; textual `BTN_MOUSE` and `BTN_LEFT` aliases are both accepted.

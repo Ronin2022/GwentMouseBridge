@@ -19,7 +19,9 @@ import android.view.Gravity;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import rikka.shizuku.Shizuku;
@@ -30,6 +32,9 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private static final long TAP_MS = 48L;
     private static final long DRAG_SEGMENT_MS = 32L;
     private static final long DIAGNOSTIC_WRITE_INTERVAL_MS = 750L;
+    private static final long FOREGROUND_RECHECK_SHORT_MS = 150L;
+    private static final long FOREGROUND_RECHECK_LONG_MS = 750L;
+    private static final long FOREGROUND_CHECK_INTERVAL_MS = 250L;
     private static final int CURSOR_SIZE_DP = 28;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -40,7 +45,13 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     private final VirtualCursorState cursor = new VirtualCursorState();
     private final MouseGestureStateMachine mouseState = new MouseGestureStateMachine();
+    private final ForegroundWindowTracker foregroundTracker =
+            new ForegroundWindowTracker(BridgePrefs.GWENT_PACKAGE);
+    private final Runnable foregroundRecheck = this::applyForegroundWindowDecision;
     private boolean gwentForeground;
+    private ForegroundWindowTracker.Decision lastForegroundDecision =
+            ForegroundWindowTracker.Decision.UNKNOWN;
+    private long lastForegroundCheckTime;
 
     private IMouseInputService remoteService;
     private boolean userServiceBinding;
@@ -164,9 +175,21 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         CharSequence packageName = event.getPackageName();
-        if (packageName == null) return;
-        String pkg = packageName.toString();
-        setGwentForeground(BridgePrefs.GWENT_PACKAGE.equals(pkg));
+        String pkg = packageName == null ? null : packageName.toString();
+        if (BridgePrefs.GWENT_PACKAGE.equals(pkg)) {
+            foregroundTracker.rememberTargetWindow(event.getWindowId());
+            lastForegroundDecision = ForegroundWindowTracker.Decision.GWENT;
+            lastForegroundCheckTime = android.os.SystemClock.elapsedRealtime();
+            mainHandler.removeCallbacks(foregroundRecheck);
+            setGwentForeground(true);
+            return;
+        }
+
+        // A heads-up notification creates a System UI window event, but normally leaves the
+        // game's input-focused window intact. Evaluate actual window focus instead of treating
+        // every non-GWENT package event as an application switch.
+        applyForegroundWindowDecision();
+        scheduleForegroundRechecks();
     }
 
     @Override
@@ -177,6 +200,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     @Override
     public void onDestroy() {
+        mainHandler.removeCallbacks(foregroundRecheck);
         stopInteraction();
         requestExclusiveCapture(false);
         removeCursor();
@@ -353,24 +377,17 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     }
 
     private boolean canInjectIntoGwent() {
-        if (!gwentForeground
-                || !BridgePrefs.enabled(this)
+        if (!BridgePrefs.enabled(this)
                 || remoteService == null
-                || !exclusiveCaptureActive
                 || !isShizukuShellReady()) return false;
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        // Surface-based games can transiently expose no accessibility root while remaining
-        // foreground. Keep the last window-event confirmation in that case; an available root
-        // is still authoritative and can immediately fail the guard closed.
-        if (root == null) return true;
-        try {
-            CharSequence pkg = root.getPackageName();
-            boolean rootIsGwent = pkg != null && BridgePrefs.GWENT_PACKAGE.contentEquals(pkg);
-            if (!rootIsGwent) setGwentForeground(false);
-            return rootIsGwent;
-        } finally {
-            root.recycle();
+
+        ForegroundWindowTracker.Decision decision = evaluateForegroundWindows(false);
+        if (decision != ForegroundWindowTracker.Decision.GWENT) {
+            setGwentForeground(false);
+            return false;
         }
+        if (!gwentForeground) setGwentForeground(true);
+        return exclusiveCaptureActive;
     }
 
     private void dispatchTap(float x, float y) {
@@ -617,6 +634,67 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
             requestExclusiveCapture(false);
         }
         updateCursorVisibility();
+    }
+
+    private void scheduleForegroundRechecks() {
+        mainHandler.removeCallbacks(foregroundRecheck);
+        mainHandler.postDelayed(foregroundRecheck, FOREGROUND_RECHECK_SHORT_MS);
+        mainHandler.postDelayed(foregroundRecheck, FOREGROUND_RECHECK_LONG_MS);
+    }
+
+    private void applyForegroundWindowDecision() {
+        setGwentForeground(
+                evaluateForegroundWindows(true) == ForegroundWindowTracker.Decision.GWENT);
+    }
+
+    private ForegroundWindowTracker.Decision evaluateForegroundWindows(boolean force) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (!force
+                && lastForegroundCheckTime != 0L
+                && now - lastForegroundCheckTime < FOREGROUND_CHECK_INTERVAL_MS) {
+            return lastForegroundDecision;
+        }
+        lastForegroundCheckTime = now;
+        List<AccessibilityWindowInfo> windows;
+        try {
+            windows = getWindows();
+        } catch (Throwable t) {
+            lastForegroundDecision = ForegroundWindowTracker.Decision.UNKNOWN;
+            return lastForegroundDecision;
+        }
+        if (windows == null || windows.isEmpty()) {
+            lastForegroundDecision = ForegroundWindowTracker.Decision.UNKNOWN;
+            return lastForegroundDecision;
+        }
+
+        List<ForegroundWindowTracker.WindowSnapshot> snapshots =
+                new ArrayList<>(windows.size());
+        for (AccessibilityWindowInfo window : windows) {
+            if (window == null) continue;
+            AccessibilityNodeInfo root = null;
+            String packageName = null;
+            try {
+                root = window.getRoot();
+                CharSequence pkg = root == null ? null : root.getPackageName();
+                if (pkg != null) packageName = pkg.toString();
+                snapshots.add(new ForegroundWindowTracker.WindowSnapshot(
+                        window.getId(),
+                        window.isFocused(),
+                        packageName));
+            } catch (Throwable ignored) {
+                snapshots.add(new ForegroundWindowTracker.WindowSnapshot(
+                        window.getId(),
+                        window.isFocused(),
+                        null));
+            } finally {
+                if (root != null) root.recycle();
+                try {
+                    window.recycle();
+                } catch (Throwable ignored) {}
+            }
+        }
+        lastForegroundDecision = foregroundTracker.evaluate(snapshots);
+        return lastForegroundDecision;
     }
 
     private void syncExclusiveCaptureMode() {
