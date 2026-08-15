@@ -4,7 +4,6 @@ import android.os.IBinder;
 import android.os.RemoteException;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -183,11 +182,7 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         try {
             return InputDeviceDiscovery.discover(
                     new FileReader("/proc/bus/input/devices"),
-                    preferredDeviceName,
-                    path -> {
-                        File input = new File(path);
-                        return input.exists() && input.canRead();
-                    });
+                    preferredDeviceName);
         } catch (Throwable t) {
             sendStatus(statusListener, "Device discovery error: " + t.getMessage());
             return null;

@@ -7,12 +7,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-/** Selects a readable relative mouse event node from a fresh /proc/bus/input/devices snapshot. */
+/** Selects a relative mouse event node from a fresh /proc/bus/input/devices snapshot. */
 final class InputDeviceDiscovery {
-    interface PathAccess {
-        boolean isReadable(String path);
-    }
-
     static final class Result {
         final String name;
         final String path;
@@ -25,8 +21,7 @@ final class InputDeviceDiscovery {
 
     private InputDeviceDiscovery() {}
 
-    static Result discover(Reader source, String preferredDeviceName, PathAccess pathAccess)
-            throws IOException {
+    static Result discover(Reader source, String preferredDeviceName) throws IOException {
         String preferred = preferredDeviceName == null ? "" : preferredDeviceName.trim();
         List<Candidate> candidates = new ArrayList<>();
 
@@ -37,17 +32,18 @@ final class InputDeviceDiscovery {
             String currentName = null;
             String currentHandlers = null;
             while ((line = reader.readLine()) != null) {
-                if (line.startsWith("N: Name=")) {
-                    currentName = unquote(line.substring("N: Name=".length()).trim());
-                } else if (line.startsWith("H: Handlers=")) {
-                    currentHandlers = line.substring("H: Handlers=".length()).trim();
-                } else if (line.trim().isEmpty()) {
-                    addCandidate(candidates, currentName, currentHandlers, preferred, pathAccess);
+                String trimmed = line.trim();
+                if (trimmed.startsWith("N: Name=")) {
+                    currentName = unquote(trimmed.substring("N: Name=".length()).trim());
+                } else if (trimmed.startsWith("H: Handlers=")) {
+                    currentHandlers = trimmed.substring("H: Handlers=".length()).trim();
+                } else if (trimmed.isEmpty()) {
+                    addCandidate(candidates, currentName, currentHandlers, preferred);
                     currentName = null;
                     currentHandlers = null;
                 }
             }
-            addCandidate(candidates, currentName, currentHandlers, preferred, pathAccess);
+            addCandidate(candidates, currentName, currentHandlers, preferred);
         }
 
         Candidate best = null;
@@ -61,14 +57,11 @@ final class InputDeviceDiscovery {
             List<Candidate> candidates,
             String name,
             String handlers,
-            String preferred,
-            PathAccess pathAccess) {
+            String preferred) {
         String event = eventHandler(handlers);
         if (event == null || name == null) return;
 
         String path = "/dev/input/" + event;
-        if (!pathAccess.isReadable(path)) return;
-
         boolean mouseHandler = hasMouseHandler(handlers);
         boolean exactPreferred = !preferred.isEmpty() && name.equalsIgnoreCase(preferred);
         String lowerName = name.toLowerCase(Locale.US);

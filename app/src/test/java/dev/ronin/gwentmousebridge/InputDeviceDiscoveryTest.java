@@ -20,7 +20,7 @@ public class InputDeviceDiscoveryTest {
     }
 
     @Test
-    public void exactPreferredMouseWinsOverOtherReadableMouse() throws Exception {
+    public void exactPreferredMouseWinsOverOtherMouse() throws Exception {
         String devices = snapshot("event14")
                 + "\nI: Bus=0003 Vendor=0001 Product=0002 Version=0001\n"
                 + "N: Name=\"Other USB Mouse\"\n"
@@ -30,8 +30,17 @@ public class InputDeviceDiscoveryTest {
         assertEquals("/dev/input/event14", result.path);
     }
 
+    @Test
+    public void indentedProcLinesAreAcceptedWithoutJavaReadabilityPreflight() throws Exception {
+        String devices = "  N: Name=\"" + NAME + "\"\n"
+                + "  H: Handlers=event14 mouse2\n\n";
+        InputDeviceDiscovery.Result result = discover(devices);
+        assertEquals(NAME, result.name);
+        assertEquals("/dev/input/event14", result.path);
+    }
+
     private static InputDeviceDiscovery.Result discover(String snapshot) throws Exception {
-        return InputDeviceDiscovery.discover(new StringReader(snapshot), NAME, path -> true);
+        return InputDeviceDiscovery.discover(new StringReader(snapshot), NAME);
     }
 
     private static String snapshot(String eventNode) {
