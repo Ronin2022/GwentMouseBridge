@@ -20,6 +20,8 @@ import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
+import java.util.List;
+
 import rikka.shizuku.Shizuku;
 
 public class MouseBridgeAccessibilityService extends AccessibilityService implements SharedPreferences.OnSharedPreferenceChangeListener {
@@ -34,10 +36,8 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private CursorOverlayView cursorView;
     private WindowManager.LayoutParams cursorParams;
 
-    private float cursorX;
-    private float cursorY;
-    private int screenWidth;
-    private int screenHeight;
+    private final VirtualCursorState cursor = new VirtualCursorState();
+    private final MouseGestureStateMachine mouseState = new MouseGestureStateMachine();
     private boolean gwentForeground;
 
     private IMouseInputService remoteService;
@@ -73,13 +73,8 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     private final IMouseEventListener eventListener = new IMouseEventListener.Stub() {
         @Override
-        public void onMove(int dx, int dy) {
-            mainHandler.post(() -> handleMouseMove(dx, dy));
-        }
-
-        @Override
-        public void onLeftButton(boolean down) {
-            mainHandler.post(() -> handleLeftButton(down));
+        public void onFrame(int dx, int dy, int leftButtonState) {
+            mainHandler.post(() -> handleMouseFrame(dx, dy, leftButtonState));
         }
 
         @Override
@@ -103,6 +98,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                 updateCursorVisibility();
             } catch (Throwable e) {
                 remoteService = null;
+                stopInteraction();
                 android.util.Log.e(TAG, "Unable to start mouse capture", e);
                 updateCursorVisibility();
             }
@@ -195,6 +191,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                 return;
             } catch (Throwable e) {
                 remoteService = null;
+                stopInteraction();
             }
         }
         maybeBindUserService();
@@ -231,39 +228,62 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         }
     }
 
-    private void handleMouseMove(int dx, int dy) {
-        if (!BridgePrefs.enabled(this)) return;
-        float sensitivity = BridgePrefs.sensitivity(this);
-        cursorX = clamp(cursorX + dx * sensitivity, 0f, Math.max(0f, screenWidth - 1f));
-        cursorY = clamp(cursorY + dy * sensitivity, 0f, Math.max(0f, screenHeight - 1f));
-        updateCursorPosition();
-
-        if (!leftDown) return;
-        if (!canInjectIntoGwent()) {
+    private void handleMouseFrame(int dx, int dy, int buttonState) {
+        if (!BridgePrefs.enabled(this)) {
             stopInteraction();
             return;
         }
-        pendingX = cursorX;
-        pendingY = cursorY;
-        pendingMove = true;
-        dispatchNextDragSegmentIfPossible();
-    }
 
-    private void handleLeftButton(boolean down) {
-        if (!BridgePrefs.enabled(this)) return;
-        if (down) {
-            if (leftDown || !canInjectIntoGwent()) return;
-            leftDown = true;
-            releaseRequested = false;
-            pendingMove = false;
-            beginPress(cursorX, cursorY);
-        } else {
-            if (!leftDown) return;
-            leftDown = false;
-            releaseRequested = true;
-            pendingX = cursorX;
-            pendingY = cursorY;
-            dispatchNextDragSegmentIfPossible();
+        float frameStartX = cursor.x();
+        float frameStartY = cursor.y();
+        boolean moved = dx != 0 || dy != 0;
+        if (moved) {
+            cursor.move(dx, dy, BridgePrefs.sensitivity(this));
+            updateCursorPosition();
+        }
+
+        List<MouseGestureStateMachine.Action> actions = mouseState.onFrame(
+                moved,
+                buttonState,
+                canInjectIntoGwent());
+        for (MouseGestureStateMachine.Action action : actions) {
+            switch (action) {
+                case PRESS:
+                    leftDown = true;
+                    releaseRequested = false;
+                    pendingMove = false;
+                    // If button-down and motion share a SYN frame, touch starts at the
+                    // previous pointer position and the frame becomes one drag segment.
+                    beginPress(moved ? frameStartX : cursor.x(), moved ? frameStartY : cursor.y());
+                    break;
+                case DRAG_START:
+                case DRAG_UPDATE:
+                    if (!leftDown || activeStroke == null) {
+                        resetGestureState();
+                        break;
+                    }
+                    pendingX = cursor.x();
+                    pendingY = cursor.y();
+                    pendingMove = true;
+                    dispatchNextDragSegmentIfPossible();
+                    break;
+                case TAP:
+                case DRAG_END:
+                    if (!leftDown || activeStroke == null) {
+                        resetGestureState();
+                        break;
+                    }
+                    leftDown = false;
+                    releaseRequested = true;
+                    pendingMove = false;
+                    pendingX = cursor.x();
+                    pendingY = cursor.y();
+                    dispatchNextDragSegmentIfPossible();
+                    break;
+                case ABORT:
+                    stopGestureInteraction();
+                    break;
+            }
         }
     }
 
@@ -309,8 +329,8 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         }
 
         if (releaseRequested) {
-            float endX = cursorX;
-            float endY = cursorY;
+            float endX = cursor.x();
+            float endY = cursor.y();
             dispatchContinuation(endX, endY, false);
             return;
         }
@@ -351,17 +371,22 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     private boolean dispatchStroke(GestureDescription.StrokeDescription stroke, Runnable completed) {
         GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
-        return dispatchGesture(gesture, new GestureResultCallback() {
-            @Override
-            public void onCompleted(GestureDescription gestureDescription) {
-                mainHandler.post(completed);
-            }
+        try {
+            return dispatchGesture(gesture, new GestureResultCallback() {
+                @Override
+                public void onCompleted(GestureDescription gestureDescription) {
+                    mainHandler.post(completed);
+                }
 
-            @Override
-            public void onCancelled(GestureDescription gestureDescription) {
-                mainHandler.post(MouseBridgeAccessibilityService.this::resetGestureState);
-            }
-        }, mainHandler);
+                @Override
+                public void onCancelled(GestureDescription gestureDescription) {
+                    mainHandler.post(MouseBridgeAccessibilityService.this::resetGestureState);
+                }
+            }, mainHandler);
+        } catch (Throwable t) {
+            android.util.Log.e(TAG, "Gesture dispatch failed", t);
+            return false;
+        }
     }
 
     private void finishStrokeImmediately() {
@@ -377,6 +402,11 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     }
 
     private void stopInteraction() {
+        mouseState.abort();
+        stopGestureInteraction();
+    }
+
+    private void stopGestureInteraction() {
         leftDown = false;
         releaseRequested = true;
         pendingMove = false;
@@ -384,6 +414,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     }
 
     private void resetGestureState() {
+        mouseState.reset();
         leftDown = false;
         gestureInFlight = false;
         releaseRequested = false;
@@ -394,15 +425,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private void updateScreenBounds(boolean recenter) {
         Point size = new Point();
         windowManager.getDefaultDisplay().getRealSize(size);
-        screenWidth = Math.max(1, size.x);
-        screenHeight = Math.max(1, size.y);
-        if (recenter || cursorX <= 0f || cursorY <= 0f) {
-            cursorX = screenWidth / 2f;
-            cursorY = screenHeight / 2f;
-        } else {
-            cursorX = clamp(cursorX, 0f, screenWidth - 1f);
-            cursorY = clamp(cursorY, 0f, screenHeight - 1f);
-        }
+        cursor.updateBounds(size.x, size.y, recenter);
     }
 
     private void updateCursorVisibility() {
@@ -451,8 +474,8 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     private void updateCursorLayoutCoordinates() {
         if (cursorParams == null) return;
-        cursorParams.x = Math.round(cursorX - cursorParams.width / 2f);
-        cursorParams.y = Math.round(cursorY - cursorParams.height / 2f);
+        cursorParams.x = Math.round(cursor.x() - cursorParams.width / 2f);
+        cursorParams.y = Math.round(cursor.y() - cursorParams.height / 2f);
     }
 
     private void removeCursor() {
@@ -462,10 +485,6 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         } catch (Throwable ignored) {}
         cursorView = null;
         cursorParams = null;
-    }
-
-    private static float clamp(float value, float min, float max) {
-        return Math.max(min, Math.min(max, value));
     }
 
     private void setGwentForeground(boolean foreground) {

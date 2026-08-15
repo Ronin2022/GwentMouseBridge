@@ -7,9 +7,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.InputStreamReader;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Runs inside a Shizuku UserService process with shell UID. */
@@ -106,7 +103,7 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         try {
             while (isActive(session)) {
                 try {
-                    DeviceCandidate device = discoverDevice(preferredDeviceName, session.listener);
+                    InputDeviceDiscovery.Result device = discoverDevice(preferredDeviceName, session.listener);
                     if (device == null) {
                         sendStatus(session.listener, "Mouse input device not found; retrying.");
                         Thread.sleep(1000);
@@ -153,12 +150,12 @@ public class MouseInputUserService extends IMouseInputService.Stub {
                 GetEventParser.Frame frame = parser.accept(line);
                 if (frame == null) continue;
                 try {
-                    if (frame.dx != 0 || frame.dy != 0) {
-                        session.listener.onMove(frame.dx, frame.dy);
-                    }
-                    if (frame.leftButtonDown != null) {
-                        session.listener.onLeftButton(frame.leftButtonDown);
-                    }
+                    int buttonState = frame.leftButtonDown == null
+                            ? MouseGestureStateMachine.BUTTON_UNCHANGED
+                            : frame.leftButtonDown
+                                    ? MouseGestureStateMachine.BUTTON_DOWN
+                                    : MouseGestureStateMachine.BUTTON_UP;
+                    session.listener.onFrame(frame.dx, frame.dy, buttonState);
                 } catch (RemoteException e) {
                     session.running.set(false);
                 }
@@ -169,85 +166,21 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         }
     }
 
-    private DeviceCandidate discoverDevice(String preferredDeviceName, IMouseEventListener statusListener) {
-        String preferred = preferredDeviceName == null ? "" : preferredDeviceName.trim();
-        List<DeviceCandidate> candidates = new ArrayList<>();
-
-        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/bus/input/devices"))) {
-            String line;
-            String currentName = null;
-            String currentHandlers = null;
-            while ((line = reader.readLine()) != null) {
-                if (line.startsWith("N: Name=")) {
-                    currentName = unquote(line.substring("N: Name=".length()).trim());
-                } else if (line.startsWith("H: Handlers=")) {
-                    currentHandlers = line.substring("H: Handlers=".length()).trim();
-                } else if (line.trim().isEmpty()) {
-                    addCandidate(candidates, currentName, currentHandlers, preferred);
-                    currentName = null;
-                    currentHandlers = null;
-                }
-            }
-            addCandidate(candidates, currentName, currentHandlers, preferred);
+    private InputDeviceDiscovery.Result discoverDevice(
+            String preferredDeviceName,
+            IMouseEventListener statusListener) {
+        try {
+            return InputDeviceDiscovery.discover(
+                    new FileReader("/proc/bus/input/devices"),
+                    preferredDeviceName,
+                    path -> {
+                        File input = new File(path);
+                        return input.exists() && input.canRead();
+                    });
         } catch (Throwable t) {
             sendStatus(statusListener, "Device discovery error: " + t.getMessage());
             return null;
         }
-
-        DeviceCandidate best = null;
-        for (DeviceCandidate candidate : candidates) {
-            if (best == null || candidate.score > best.score) best = candidate;
-        }
-        return best;
-    }
-
-    private static void addCandidate(
-            List<DeviceCandidate> candidates,
-            String name,
-            String handlers,
-            String preferred) {
-        String event = eventHandler(handlers);
-        if (event == null || name == null) return;
-
-        String path = "/dev/input/" + event;
-        File input = new File(path);
-        if (!input.exists() || !input.canRead()) return;
-
-        boolean mouseHandler = hasMouseHandler(handlers);
-        boolean exactPreferred = !preferred.isEmpty() && name.equalsIgnoreCase(preferred);
-        String lowerName = name.toLowerCase(Locale.US);
-        boolean mouseLikeName = lowerName.contains("mouse") || lowerName.contains("pointer");
-
-        int score = 0;
-        if (exactPreferred && mouseHandler) score = 4;
-        else if (exactPreferred) score = 3;
-        else if (mouseHandler && mouseLikeName) score = 2;
-        else if (mouseHandler) score = 1;
-
-        if (score > 0) candidates.add(new DeviceCandidate(name, path, score));
-    }
-
-    private static String eventHandler(String handlers) {
-        if (handlers == null) return null;
-        for (String token : handlers.split("\\s+")) {
-            if (token.startsWith("event")) return token;
-        }
-        return null;
-    }
-
-    private static boolean hasMouseHandler(String handlers) {
-        if (handlers == null) return false;
-        for (String token : handlers.split("\\s+")) {
-            if (token.startsWith("mouse")) return true;
-        }
-        return false;
-    }
-
-    private static String unquote(String value) {
-        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
-            return value.substring(1, value.length() - 1);
-        }
-        return value;
     }
 
     private static void sendStatus(IMouseEventListener listener, String message) {
@@ -268,18 +201,6 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         CaptureSession(IMouseEventListener listener) {
             this.listener = listener;
             this.deathRecipient = () -> onListenerDied(this);
-        }
-    }
-
-    private static final class DeviceCandidate {
-        final String name;
-        final String path;
-        final int score;
-
-        DeviceCandidate(String name, String path, int score) {
-            this.name = name;
-            this.path = path;
-            this.score = score;
         }
     }
 }

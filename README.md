@@ -7,7 +7,7 @@ The target device sees the physical mouse at the Linux/Android input layer, but 
 ## MVP behavior
 
 - Shizuku UserService runs with shell identity and reads the physical mouse event stream using `/system/bin/getevent`.
-- `REL_X` / `REL_Y` update an internal virtual cursor.
+- `REL_X` / `REL_Y` are accumulated until `SYN_REPORT`, then update the virtual cursor once per Linux input frame.
 - A non-touchable Accessibility overlay makes that virtual cursor visible while GWENT is foreground.
 - Left-button press starts a touch stroke.
 - Mouse motion while held extends that same stroke using `StrokeDescription.continueStroke()`, providing drag behavior for cards.
@@ -15,6 +15,7 @@ The target device sees the physical mouse at the Linux/Android input layer, but 
 - No gesture is intentionally injected outside `com.cdprojektred.gwent`.
 - No root, internet permission, analytics, right-click mapping, or scroll mapping.
 - Input capture fails closed unless Shizuku reports the non-root shell identity (UID 2000).
+- The left button is recognized by canonical numeric code `0x110`; textual `BTN_MOUSE` and `BTN_LEFT` aliases are both accepted.
 
 ## First-device assumptions
 
@@ -22,7 +23,7 @@ The target device sees the physical mouse at the Linux/Android input layer, but 
 - Huawei tablet
 - Preferred input device name: `HUAWEI Mouse CD26 SE Mouse`
 
-The privileged reader discovers the corresponding `/dev/input/event*` node from `/proc/bus/input/devices`; it does not hard-code `event14`.
+The privileged reader discovers the corresponding `/dev/input/event*` node from a fresh `/proc/bus/input/devices` snapshot whenever capture starts or a disconnected reader retries; it does not hard-code `event14`.
 
 ## Setup on the tablet
 
