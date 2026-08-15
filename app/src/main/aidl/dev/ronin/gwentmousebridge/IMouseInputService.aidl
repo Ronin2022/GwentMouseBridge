@@ -8,4 +8,5 @@ interface IMouseInputService {
     void stopCapture() = 2;
     String getDevicePath() = 3;
     boolean isRunning() = 4;
+    boolean setExclusiveCapture(boolean enabled) = 5;
 }

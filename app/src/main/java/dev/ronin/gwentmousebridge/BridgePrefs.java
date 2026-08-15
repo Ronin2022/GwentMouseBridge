@@ -13,6 +13,8 @@ final class BridgePrefs {
     static final String KEY_READER_MOTION_FRAME_COUNT = "reader_motion_frame_count";
     static final String KEY_READER_LAST_FRAME_TIME = "reader_last_frame_time";
     static final String KEY_GESTURE_STATUS = "gesture_status";
+    static final String KEY_CAPTURE_ACTIVE = "capture_active";
+    static final String KEY_CAPTURE_STATUS = "capture_status";
 
     static final String GWENT_PACKAGE = "com.cdprojektred.gwent";
     static final String PREFERRED_MOUSE = "HUAWEI Mouse CD26 SE Mouse";

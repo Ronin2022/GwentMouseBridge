@@ -6,7 +6,11 @@ The target device sees the physical mouse at the Linux/Android input layer, but 
 
 ## MVP behavior
 
-- Shizuku UserService runs with shell identity and reads the physical mouse event stream using `/system/bin/getevent`.
+- Shizuku UserService runs with shell identity and reads numeric Linux `input_event` records
+  directly from the dynamically discovered mouse node.
+- While GWENT is foreground, the reader uses `EVIOCGRAB` on that open node so Android 12
+  cannot cancel an injected touch drag with a simultaneous hardware mouse hover event.
+  The grab is released on foreground loss, bridge disable, disconnect, binder death, and shutdown.
 - `REL_X` / `REL_Y` are accumulated until `SYN_REPORT`, then update the virtual cursor once per Linux input frame.
 - A non-touchable Accessibility overlay makes that virtual cursor visible while GWENT is foreground.
 - Left-button press arms an interaction. Releasing without motion dispatches one tap.
@@ -40,10 +44,15 @@ whenever capture starts or a disconnected reader retries; it does not hard-code 
 
 ## Build
 
-The repository includes the Gradle 8.9 Wrapper. The `Build debug APK` GitHub Actions workflow installs JDK 17 and Android SDK 35, validates the wrapper, runs unit tests plus `assembleDebug`, and uploads `app-debug.apk` as `GwentMouseBridge-debug`.
+The repository includes the Gradle 8.9 Wrapper. The `Build debug APK` GitHub Actions workflow
+installs JDK 17, Android SDK 35, NDK, and CMake; runs unit tests plus `assembleDebug`; and uploads
+`app-debug.apk` as `GwentMouseBridge-debug`.
 
 ## Safety notes
 
-This is an early prototype. The Accessibility service has gesture-injection capability by design. Its code gates injections on GWENT foreground state and the user's explicit bridge switch. Review the source before enabling the service.
+This is an early prototype. The Accessibility service has gesture-injection capability by design.
+Its code gates both gesture injection and exclusive mouse capture on GWENT foreground state,
+Shizuku shell availability, and the user's explicit bridge switch. Review the source before
+enabling the service.
 
 Not affiliated with CD PROJEKT RED, Huawei, Android, or Shizuku.

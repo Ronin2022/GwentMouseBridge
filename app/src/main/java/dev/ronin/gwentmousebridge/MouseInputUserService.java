@@ -3,7 +3,6 @@ package dev.ronin.gwentmousebridge;
 import android.os.IBinder;
 import android.os.RemoteException;
 
-import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -11,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Runs inside a Shizuku UserService process with shell UID. */
 public class MouseInputUserService extends IMouseInputService.Stub {
     private static final int SHELL_UID = 2000;
+    private static final int READ_POLL_MS = 250;
 
     private volatile CaptureSession activeSession;
     private volatile String lastDevicePath;
@@ -25,6 +25,13 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         int uid = android.os.Process.myUid();
         if (uid != SHELL_UID) {
             sendStatus(newListener, "Input capture refused: expected shell UID 2000, got " + uid + '.');
+            return;
+        }
+
+        try {
+            NativeInputReader.requireAvailable();
+        } catch (Throwable t) {
+            sendStatus(newListener, safeMessage(t));
             return;
         }
 
@@ -48,6 +55,14 @@ public class MouseInputUserService extends IMouseInputService.Stub {
     @Override
     public synchronized void stopCapture() {
         stopCaptureInternal();
+    }
+
+    @Override
+    public boolean setExclusiveCapture(boolean enabled) {
+        CaptureSession session = activeSession;
+        if (session == null || !session.running.get()) return false;
+        session.exclusiveRequested = enabled;
+        return applyExclusiveMode(session, enabled, true);
     }
 
     @Override
@@ -85,11 +100,12 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         if (session != null) terminateSession(session);
     }
 
-    private static void terminateSession(CaptureSession session) {
+    private void terminateSession(CaptureSession session) {
         session.running.set(false);
-        java.lang.Process process = session.process;
-        session.process = null;
-        if (process != null) process.destroy();
+        session.exclusiveRequested = false;
+        // Release synchronously so the system mouse is restored even while the read thread is
+        // still leaving its bounded native poll.
+        applyExclusiveMode(session, false, false);
         Thread thread = session.thread;
         session.thread = null;
         if (thread != null && thread != Thread.currentThread()) thread.interrupt();
@@ -111,13 +127,12 @@ public class MouseInputUserService extends IMouseInputService.Stub {
 
                     session.devicePath = device.path;
                     lastDevicePath = device.path;
-                    sendStatus(session.listener, "Reading " + device.name + " at " + device.path);
-                    readGetevent(session, device.path);
+                    readNativeEvents(session, device);
                 } catch (InterruptedException ignored) {
                     Thread.currentThread().interrupt();
                     return;
                 } catch (Throwable t) {
-                    sendStatus(session.listener, "Mouse reader error: " + t.getMessage());
+                    sendStatus(session.listener, "Mouse reader error: " + safeMessage(t));
                 }
 
                 if (isActive(session)) Thread.sleep(500);
@@ -136,44 +151,103 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         return activeSession == session && session.running.get();
     }
 
-    private void readGetevent(CaptureSession session, String path) throws Exception {
-        // Match the exact labelled + timestamped command proven on the Huawei tablet.
-        java.lang.Process process = new ProcessBuilder("/system/bin/getevent", "-lt", path)
-                .redirectErrorStream(true)
-                .start();
-        session.process = process;
-        GetEventParser parser = new GetEventParser();
+    private void readNativeEvents(CaptureSession session, InputDeviceDiscovery.Result device)
+            throws InterruptedException {
+        int openedFd = NativeInputReader.openDevice(device.path);
+        if (openedFd < 0) {
+            sendStatus(session.listener, NativeInputReader.error("Opening " + device.path, openedFd));
+            return;
+        }
 
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            String line;
-            boolean rawInputReported = false;
-            boolean parsedInputReported = false;
-            while (isActive(session) && (line = reader.readLine()) != null) {
-                if (!rawInputReported && !line.trim().isEmpty()) {
-                    rawInputReported = true;
-                    sendStatus(session.listener, "Raw input detected at " + path);
+        synchronized (session.deviceLock) {
+            if (!isActive(session)) {
+                NativeInputReader.closeDevice(openedFd);
+                return;
+            }
+            session.fd = openedFd;
+        }
+
+        sendStatus(session.listener, "Reading " + device.name + " at " + device.path);
+        applyExclusiveMode(session, session.exclusiveRequested, true);
+        LinuxInputFrameAccumulator accumulator = new LinuxInputFrameAccumulator();
+        int[] event = new int[3];
+        boolean inputReported = false;
+
+        try {
+            while (isActive(session)) {
+                int result = NativeInputReader.readEvent(openedFd, event, READ_POLL_MS);
+                if (result == 0) continue;
+                if (result < 0) {
+                    sendStatus(session.listener, NativeInputReader.error("Reading " + device.path, result));
+                    return;
                 }
-                GetEventParser.Frame frame = parser.accept(line);
-                if (frame == null) continue;
-                if (!parsedInputReported) {
-                    parsedInputReported = true;
-                    sendStatus(session.listener, "Parsed input frames from " + path);
+                if (!inputReported) {
+                    inputReported = true;
+                    sendStatus(session.listener, "Parsed native input frames from " + device.path);
                 }
-                try {
-                    int buttonState = frame.leftButtonDown == null
-                            ? MouseGestureStateMachine.BUTTON_UNCHANGED
-                            : frame.leftButtonDown
-                                    ? MouseGestureStateMachine.BUTTON_DOWN
-                                    : MouseGestureStateMachine.BUTTON_UP;
-                    session.listener.onFrame(frame.dx, frame.dy, buttonState);
-                } catch (RemoteException e) {
-                    session.running.set(false);
-                }
+                GetEventParser.Frame frame = accumulator.accept(event[0], event[1], event[2]);
+                if (frame != null) sendFrame(session, frame);
             }
         } finally {
-            if (session.process == process) session.process = null;
-            process.destroy();
+            synchronized (session.deviceLock) {
+                if (session.fd == openedFd) {
+                    if (session.exclusiveActive) NativeInputReader.setExclusive(openedFd, false);
+                    session.exclusiveActive = false;
+                    session.fd = -1;
+                }
+            }
+            NativeInputReader.closeDevice(openedFd);
+            if (isActive(session)) {
+                sendExclusiveStatus(session, false, "Mouse disconnected; exclusive capture released");
+            }
         }
+    }
+
+    private void sendFrame(CaptureSession session, GetEventParser.Frame frame) {
+        if (!isActive(session)) return;
+        try {
+            int buttonState = frame.leftButtonDown == null
+                    ? MouseGestureStateMachine.BUTTON_UNCHANGED
+                    : frame.leftButtonDown
+                            ? MouseGestureStateMachine.BUTTON_DOWN
+                            : MouseGestureStateMachine.BUTTON_UP;
+            session.listener.onFrame(frame.dx, frame.dy, buttonState);
+        } catch (RemoteException e) {
+            session.running.set(false);
+        }
+    }
+
+    private boolean applyExclusiveMode(CaptureSession session, boolean enabled, boolean report) {
+        String message;
+        boolean active;
+        synchronized (session.deviceLock) {
+            int fd = session.fd;
+            if (fd < 0) {
+                session.exclusiveActive = false;
+                active = false;
+                message = enabled
+                        ? "Exclusive capture requested; waiting for mouse device"
+                        : "Exclusive capture inactive";
+            } else if (session.exclusiveActive == enabled) {
+                active = session.exclusiveActive;
+                message = active ? "Exclusive capture active" : "Exclusive capture inactive";
+            } else {
+                int result = NativeInputReader.setExclusive(fd, enabled);
+                if (result == 0) {
+                    session.exclusiveActive = enabled;
+                    active = enabled;
+                    message = enabled ? "Exclusive capture active" : "Exclusive capture released";
+                } else {
+                    if (!enabled) session.exclusiveActive = false;
+                    active = session.exclusiveActive;
+                    message = NativeInputReader.error(
+                            enabled ? "EVIOCGRAB enable" : "EVIOCGRAB release",
+                            result);
+                }
+            }
+        }
+        if (report) sendExclusiveStatus(session, active, message);
+        return active;
     }
 
     private InputDeviceDiscovery.Result discoverDevice(
@@ -186,7 +260,7 @@ public class MouseInputUserService extends IMouseInputService.Stub {
             if (result != null) return result;
             sendStatus(statusListener, "/proc inventory did not identify the mouse; trying getevent inventory.");
         } catch (Throwable t) {
-            sendStatus(statusListener, "/proc discovery unavailable; trying getevent inventory: " + t.getMessage());
+            sendStatus(statusListener, "/proc discovery unavailable; trying getevent inventory: " + safeMessage(t));
         }
 
         java.lang.Process process = null;
@@ -196,9 +270,7 @@ public class MouseInputUserService extends IMouseInputService.Stub {
                     .start();
             InputDeviceDiscovery.Result result;
             try (InputStreamReader output = new InputStreamReader(process.getInputStream())) {
-                result = InputDeviceDiscovery.discoverGeteventInventory(
-                        output,
-                        preferredDeviceName);
+                result = InputDeviceDiscovery.discoverGeteventInventory(output, preferredDeviceName);
             }
             int exitCode = process.waitFor();
             if (result == null) {
@@ -209,7 +281,7 @@ public class MouseInputUserService extends IMouseInputService.Stub {
             Thread.currentThread().interrupt();
             return null;
         } catch (Throwable t) {
-            sendStatus(statusListener, "getevent inventory error: " + t.getMessage());
+            sendStatus(statusListener, "getevent inventory error: " + safeMessage(t));
             return null;
         } finally {
             if (process != null) process.destroy();
@@ -223,13 +295,32 @@ public class MouseInputUserService extends IMouseInputService.Stub {
         } catch (RemoteException ignored) {}
     }
 
+    private static void sendExclusiveStatus(
+            CaptureSession session,
+            boolean active,
+            String message) {
+        try {
+            session.listener.onExclusiveCaptureChanged(active, message);
+        } catch (RemoteException ignored) {}
+    }
+
+    private static String safeMessage(Throwable throwable) {
+        String message = throwable == null ? null : throwable.getMessage();
+        return message == null || message.isEmpty()
+                ? (throwable == null ? "unknown" : throwable.getClass().getSimpleName())
+                : message;
+    }
+
     private final class CaptureSession {
         final IMouseEventListener listener;
         final AtomicBoolean running = new AtomicBoolean(false);
         final IBinder.DeathRecipient deathRecipient;
+        final Object deviceLock = new Object();
         volatile Thread thread;
-        volatile java.lang.Process process;
         volatile String devicePath;
+        volatile boolean exclusiveRequested;
+        boolean exclusiveActive;
+        int fd = -1;
 
         CaptureSession(IMouseEventListener listener) {
             this.listener = listener;

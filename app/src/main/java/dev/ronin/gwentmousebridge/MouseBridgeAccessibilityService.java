@@ -44,6 +44,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     private IMouseInputService remoteService;
     private boolean userServiceBinding;
+    private boolean exclusiveCaptureActive;
     private long readerFrameCount;
     private long readerMotionFrameCount;
     private long lastDiagnosticWriteTime;
@@ -65,6 +66,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private final Shizuku.OnBinderDeadListener binderDeadListener = () -> mainHandler.post(() -> {
         remoteService = null;
         userServiceBinding = false;
+        recordCaptureStatus(false, "Shizuku binder disconnected; capture released");
         recordReaderStatus("Shizuku binder disconnected");
         stopInteraction();
         updateCursorVisibility();
@@ -73,6 +75,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         mainHandler.post(() -> {
             if (grantResult == PERMISSION_GRANTED) maybeBindUserService();
             else {
+                recordCaptureStatus(false, "Shizuku permission unavailable");
                 recordReaderStatus("Shizuku permission unavailable");
                 stopInteraction();
                 updateCursorVisibility();
@@ -91,6 +94,16 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
             android.util.Log.i(TAG, status);
             mainHandler.post(() -> recordReaderStatus(status));
         }
+
+        @Override
+        public void onExclusiveCaptureChanged(boolean active, String status) {
+            mainHandler.post(() -> {
+                exclusiveCaptureActive = active;
+                recordCaptureStatus(active, status);
+                if (!active && leftDown) stopInteraction();
+                updateCursorVisibility();
+            });
+        }
     };
 
     private final ServiceConnection userServiceConnection = new ServiceConnection() {
@@ -106,6 +119,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
             try {
                 resetReaderDiagnostics("Starting mouse capture");
                 remoteService.startCapture(eventListener, BridgePrefs.PREFERRED_MOUSE);
+                syncExclusiveCaptureMode();
                 updateCursorVisibility();
             } catch (Throwable e) {
                 remoteService = null;
@@ -119,6 +133,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         public void onServiceDisconnected(ComponentName name) {
             userServiceBinding = false;
             remoteService = null;
+            recordCaptureStatus(false, "Mouse UserService disconnected; capture released");
             recordReaderStatus("Mouse UserService disconnected");
             stopInteraction();
             updateCursorVisibility();
@@ -151,18 +166,19 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         CharSequence packageName = event.getPackageName();
         if (packageName == null) return;
         String pkg = packageName.toString();
-        if (BuildConfig.APPLICATION_ID.equals(pkg)) return;
         setGwentForeground(BridgePrefs.GWENT_PACKAGE.equals(pkg));
     }
 
     @Override
     public void onInterrupt() {
         stopInteraction();
+        requestExclusiveCapture(false);
     }
 
     @Override
     public void onDestroy() {
         stopInteraction();
+        requestExclusiveCapture(false);
         removeCursor();
         if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(this);
         Shizuku.removeBinderReceivedListener(binderReceivedListener);
@@ -183,9 +199,13 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     @Override
     public void onSharedPreferenceChanged(SharedPreferences sharedPreferences, String key) {
         if (BridgePrefs.KEY_ENABLED.equals(key)) {
-            if (BridgePrefs.enabled(this)) ensureRemoteCapture();
+            if (BridgePrefs.enabled(this)) {
+                ensureRemoteCapture();
+                syncExclusiveCaptureMode();
+            }
             else {
                 stopInteraction();
+                requestExclusiveCapture(false);
                 stopRemoteCapture();
             }
             updateCursorVisibility();
@@ -200,6 +220,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         if (service != null) {
             try {
                 service.startCapture(eventListener, BridgePrefs.PREFERRED_MOUSE);
+                syncExclusiveCaptureMode();
                 return;
             } catch (Throwable e) {
                 remoteService = null;
@@ -235,9 +256,11 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         IMouseInputService service = remoteService;
         if (service != null) {
             try {
+                service.setExclusiveCapture(false);
                 service.stopCapture();
             } catch (RemoteException ignored) {}
         }
+        recordCaptureStatus(false, "Bridge disabled; capture released");
     }
 
     private void handleMouseFrame(int dx, int dy, int buttonState) {
@@ -333,6 +356,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         if (!gwentForeground
                 || !BridgePrefs.enabled(this)
                 || remoteService == null
+                || !exclusiveCaptureActive
                 || !isShizukuShellReady()) return false;
         AccessibilityNodeInfo root = getRootInActiveWindow();
         // Surface-based games can transiently expose no accessibility root while remaining
@@ -527,6 +551,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                 && BridgePrefs.enabled(this)
                 && BridgePrefs.showCursor(this)
                 && remoteService != null
+                && exclusiveCaptureActive
                 && isShizukuShellReady();
         if (shouldShow) ensureCursor();
         else removeCursor();
@@ -586,10 +611,41 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         gwentForeground = foreground;
         if (foreground) {
             updateScreenBounds(true);
+            syncExclusiveCaptureMode();
         } else {
             stopInteraction();
+            requestExclusiveCapture(false);
         }
         updateCursorVisibility();
+    }
+
+    private void syncExclusiveCaptureMode() {
+        boolean desired = gwentForeground
+                && BridgePrefs.enabled(this)
+                && remoteService != null
+                && isShizukuShellReady();
+        requestExclusiveCapture(desired);
+    }
+
+    private void requestExclusiveCapture(boolean enabled) {
+        IMouseInputService service = remoteService;
+        if (service == null) {
+            if (!enabled) recordCaptureStatus(false, "Mouse UserService unavailable");
+            return;
+        }
+        try {
+            boolean active = service.setExclusiveCapture(enabled);
+            exclusiveCaptureActive = enabled && active;
+            if (enabled && !active) {
+                recordCaptureStatus(false, "Exclusive capture requested; waiting for mouse device");
+            } else if (!enabled) {
+                recordCaptureStatus(false, "GWENT is not foreground; capture released");
+            }
+        } catch (Throwable t) {
+            exclusiveCaptureActive = false;
+            recordCaptureStatus(false, "Exclusive capture call failed: " + safeMessage(t));
+            if (enabled) stopInteraction();
+        }
     }
 
     private void resetReaderDiagnostics(String status) {
@@ -626,6 +682,17 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                 .putLong(BridgePrefs.KEY_READER_FRAME_COUNT, readerFrameCount)
                 .putLong(BridgePrefs.KEY_READER_MOTION_FRAME_COUNT, readerMotionFrameCount)
                 .putLong(BridgePrefs.KEY_READER_LAST_FRAME_TIME, System.currentTimeMillis())
+                .apply();
+    }
+
+    private void recordCaptureStatus(boolean active, String status) {
+        exclusiveCaptureActive = active;
+        if (prefs == null) return;
+        prefs.edit()
+                .putBoolean(BridgePrefs.KEY_CAPTURE_ACTIVE, active)
+                .putString(
+                        BridgePrefs.KEY_CAPTURE_STATUS,
+                        status == null ? "Unknown capture state" : status)
                 .apply();
     }
 

@@ -34,7 +34,9 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
             (sharedPreferences, key) -> {
-                if (key != null && (key.startsWith("reader_") || key.startsWith("gesture_"))) {
+                if (key != null && (key.startsWith("reader_")
+                        || key.startsWith("gesture_")
+                        || key.startsWith("capture_"))) {
                     refreshStatus();
                 }
             };
@@ -156,6 +158,10 @@ public class MainActivity extends Activity {
             String gestureStatus = prefs.getString(
                     BridgePrefs.KEY_GESTURE_STATUS,
                     "No gesture attempted yet");
+            boolean captureActive = prefs.getBoolean(BridgePrefs.KEY_CAPTURE_ACTIVE, false);
+            String captureStatus = prefs.getString(
+                    BridgePrefs.KEY_CAPTURE_STATUS,
+                    "Exclusive capture has not been requested");
             long frames = prefs.getLong(BridgePrefs.KEY_READER_FRAME_COUNT, 0L);
             long motionFrames = prefs.getLong(BridgePrefs.KEY_READER_MOTION_FRAME_COUNT, 0L);
             long lastFrameTime = prefs.getLong(BridgePrefs.KEY_READER_LAST_FRAME_TIME, 0L);
@@ -169,6 +175,7 @@ public class MainActivity extends Activity {
                     + "\nReader: " + readerStatus
                     + "\nFrames: " + frames + " total / " + motionFrames + " motion"
                     + "\nLast frame: " + lastFrame
+                    + "\nCapture: " + (captureActive ? "ACTIVE - " : "inactive - ") + captureStatus
                     + "\nGesture: " + gestureStatus
                     + "\nTarget: " + BridgePrefs.GWENT_PACKAGE;
             statusText.setText(text);
