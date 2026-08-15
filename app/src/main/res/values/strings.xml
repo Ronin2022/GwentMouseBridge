@@ -1,5 +1,7 @@
 <resources>
     <string name="app_name">Gwent Mouse Bridge</string>
+    <string name="version_placeholder">Version</string>
+    <string name="version_format">Version %1$s (build %2$d)</string>
     <string name="accessibility_service_label">Gwent Mouse Bridge</string>
     <string name="accessibility_description">Converts physical mouse left-click and drag input into touch gestures only while GWENT is in the foreground.</string>
     <string name="status_waiting">Waiting for setup</string>

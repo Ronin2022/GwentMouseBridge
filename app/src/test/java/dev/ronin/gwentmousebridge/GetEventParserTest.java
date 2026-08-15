@@ -88,6 +88,19 @@ public class GetEventParserTest {
         assertEquals(-3, frame.dy);
     }
 
+    @Test
+    public void timestampedOperitGeteventMovementIsParsedAtSynReport() {
+        GetEventParser parser = new GetEventParser();
+        assertNull(parser.accept(
+                "[  4812.123456] /dev/input/event14: EV_REL       REL_X                00000005"));
+        assertNull(parser.accept(
+                "[  4812.123457] /dev/input/event14: EV_REL       REL_Y                fffffff9"));
+        GetEventParser.Frame frame = parser.accept(
+                "[  4812.123458] /dev/input/event14: EV_SYN       SYN_REPORT           00000000");
+        assertEquals(5, frame.dx);
+        assertEquals(-7, frame.dy);
+    }
+
     private static void assertTextButtonProducesTap(String alias) {
         GetEventParser parser = new GetEventParser();
         MouseGestureStateMachine state = new MouseGestureStateMachine();

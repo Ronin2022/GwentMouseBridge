@@ -28,6 +28,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private static final String TAG = "GwentMouseBridge";
     private static final int SHELL_UID = 2000;
     private static final long SEGMENT_MS = 18L;
+    private static final long DIAGNOSTIC_WRITE_INTERVAL_MS = 750L;
     private static final int CURSOR_SIZE_DP = 28;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -42,6 +43,9 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
     private IMouseInputService remoteService;
     private boolean userServiceBinding;
+    private long readerFrameCount;
+    private long readerMotionFrameCount;
+    private long lastDiagnosticWriteTime;
 
     private boolean leftDown;
     private boolean gestureInFlight;
@@ -58,6 +62,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private final Shizuku.OnBinderDeadListener binderDeadListener = () -> mainHandler.post(() -> {
         remoteService = null;
         userServiceBinding = false;
+        recordReaderStatus("Shizuku binder disconnected");
         stopInteraction();
         updateCursorVisibility();
     });
@@ -65,6 +70,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         mainHandler.post(() -> {
             if (grantResult == PERMISSION_GRANTED) maybeBindUserService();
             else {
+                recordReaderStatus("Shizuku permission unavailable");
                 stopInteraction();
                 updateCursorVisibility();
             }
@@ -80,6 +86,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         @Override
         public void onStatus(String status) {
             android.util.Log.i(TAG, status);
+            mainHandler.post(() -> recordReaderStatus(status));
         }
     };
 
@@ -94,6 +101,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
             }
             remoteService = IMouseInputService.Stub.asInterface(binder);
             try {
+                resetReaderDiagnostics("Starting mouse capture");
                 remoteService.startCapture(eventListener, BridgePrefs.PREFERRED_MOUSE);
                 updateCursorVisibility();
             } catch (Throwable e) {
@@ -108,6 +116,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         public void onServiceDisconnected(ComponentName name) {
             userServiceBinding = false;
             remoteService = null;
+            recordReaderStatus("Mouse UserService disconnected");
             stopInteraction();
             updateCursorVisibility();
         }
@@ -229,6 +238,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     }
 
     private void handleMouseFrame(int dx, int dy, int buttonState) {
+        recordReaderFrame(dx, dy);
         if (!BridgePrefs.enabled(this)) {
             stopInteraction();
             return;
@@ -496,6 +506,43 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
             stopInteraction();
         }
         updateCursorVisibility();
+    }
+
+    private void resetReaderDiagnostics(String status) {
+        readerFrameCount = 0L;
+        readerMotionFrameCount = 0L;
+        lastDiagnosticWriteTime = 0L;
+        if (prefs == null) return;
+        prefs.edit()
+                .putString(BridgePrefs.KEY_READER_STATUS, status)
+                .putLong(BridgePrefs.KEY_READER_FRAME_COUNT, 0L)
+                .putLong(BridgePrefs.KEY_READER_MOTION_FRAME_COUNT, 0L)
+                .putLong(BridgePrefs.KEY_READER_LAST_FRAME_TIME, 0L)
+                .apply();
+    }
+
+    private void recordReaderStatus(String status) {
+        if (prefs == null) return;
+        prefs.edit()
+                .putString(
+                        BridgePrefs.KEY_READER_STATUS,
+                        status == null ? "Unknown reader status" : status)
+                .apply();
+    }
+
+    private void recordReaderFrame(int dx, int dy) {
+        readerFrameCount++;
+        if (dx != 0 || dy != 0) readerMotionFrameCount++;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (lastDiagnosticWriteTime != 0L
+                && now - lastDiagnosticWriteTime < DIAGNOSTIC_WRITE_INTERVAL_MS) return;
+        lastDiagnosticWriteTime = now;
+        if (prefs == null) return;
+        prefs.edit()
+                .putLong(BridgePrefs.KEY_READER_FRAME_COUNT, readerFrameCount)
+                .putLong(BridgePrefs.KEY_READER_MOTION_FRAME_COUNT, readerMotionFrameCount)
+                .putLong(BridgePrefs.KEY_READER_LAST_FRAME_TIME, System.currentTimeMillis())
+                .apply();
     }
 
     private static boolean isShizukuShellReady() {

@@ -16,6 +16,8 @@ import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 
+import java.text.DateFormat;
+import java.util.Date;
 import java.util.List;
 
 import rikka.shizuku.Shizuku;
@@ -30,6 +32,10 @@ public class MainActivity extends Activity {
     private Switch cursorSwitch;
     private SeekBar sensitivitySeek;
     private SharedPreferences prefs;
+    private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
+            (sharedPreferences, key) -> {
+                if (key != null && key.startsWith("reader_")) refreshStatus();
+            };
 
     private final Shizuku.OnBinderReceivedListener binderReceivedListener = this::refreshStatus;
     private final Shizuku.OnBinderDeadListener binderDeadListener = this::refreshStatus;
@@ -44,12 +50,19 @@ public class MainActivity extends Activity {
 
         prefs = BridgePrefs.prefs(this);
         statusText = findViewById(R.id.statusText);
+        TextView versionText = findViewById(R.id.versionText);
         sensitivityLabel = findViewById(R.id.sensitivityLabel);
         bridgeSwitch = findViewById(R.id.bridgeSwitch);
         cursorSwitch = findViewById(R.id.cursorSwitch);
         sensitivitySeek = findViewById(R.id.sensitivitySeek);
         Button shizukuButton = findViewById(R.id.shizukuButton);
         Button accessibilityButton = findViewById(R.id.accessibilityButton);
+
+        versionText.setText(getString(
+                R.string.version_format,
+                BuildConfig.VERSION_NAME,
+                BuildConfig.VERSION_CODE));
+        prefs.registerOnSharedPreferenceChangeListener(prefsListener);
 
         bridgeSwitch.setChecked(BridgePrefs.enabled(this));
         cursorSwitch.setChecked(BridgePrefs.showCursor(this));
@@ -91,6 +104,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        prefs.unregisterOnSharedPreferenceChangeListener(prefsListener);
         Shizuku.removeBinderReceivedListener(binderReceivedListener);
         Shizuku.removeBinderDeadListener(binderDeadListener);
         Shizuku.removeRequestPermissionResultListener(permissionListener);
@@ -134,10 +148,22 @@ public class MainActivity extends Activity {
             } catch (Throwable ignored) {}
 
             boolean accessibility = isAccessibilityServiceEnabled(this);
+            String readerStatus = prefs.getString(
+                    BridgePrefs.KEY_READER_STATUS,
+                    "No reader status yet");
+            long frames = prefs.getLong(BridgePrefs.KEY_READER_FRAME_COUNT, 0L);
+            long motionFrames = prefs.getLong(BridgePrefs.KEY_READER_MOTION_FRAME_COUNT, 0L);
+            long lastFrameTime = prefs.getLong(BridgePrefs.KEY_READER_LAST_FRAME_TIME, 0L);
+            String lastFrame = lastFrameTime == 0L
+                    ? "never"
+                    : DateFormat.getTimeInstance(DateFormat.MEDIUM).format(new Date(lastFrameTime));
             String text = "Shizuku: " + (shizukuReady ? (shizukuGranted ? "ready + granted" : "ready, permission needed") : "not ready")
                     + (shizukuGranted ? " (UID " + shizukuUid + (shizukuUid == SHELL_UID ? ", shell" : ", unsupported") + ")" : "")
                     + "\nAccessibility: " + (accessibility ? "enabled" : "disabled")
                     + "\nBridge switch: " + (BridgePrefs.enabled(this) ? "ON" : "OFF")
+                    + "\nReader: " + readerStatus
+                    + "\nFrames: " + frames + " total / " + motionFrames + " motion"
+                    + "\nLast frame: " + lastFrame
                     + "\nTarget: " + BridgePrefs.GWENT_PACKAGE;
             statusText.setText(text);
         });

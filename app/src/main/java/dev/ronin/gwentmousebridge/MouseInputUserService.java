@@ -138,7 +138,8 @@ public class MouseInputUserService extends IMouseInputService.Stub {
     }
 
     private void readGetevent(CaptureSession session, String path) throws Exception {
-        java.lang.Process process = new ProcessBuilder("/system/bin/getevent", "-l", path)
+        // Match the exact labelled + timestamped command proven on the Huawei tablet.
+        java.lang.Process process = new ProcessBuilder("/system/bin/getevent", "-lt", path)
                 .redirectErrorStream(true)
                 .start();
         session.process = process;
@@ -146,9 +147,19 @@ public class MouseInputUserService extends IMouseInputService.Stub {
 
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
             String line;
+            boolean rawInputReported = false;
+            boolean parsedInputReported = false;
             while (isActive(session) && (line = reader.readLine()) != null) {
+                if (!rawInputReported && !line.trim().isEmpty()) {
+                    rawInputReported = true;
+                    sendStatus(session.listener, "Raw input detected at " + path);
+                }
                 GetEventParser.Frame frame = parser.accept(line);
                 if (frame == null) continue;
+                if (!parsedInputReported) {
+                    parsedInputReported = true;
+                    sendStatus(session.listener, "Parsed input frames from " + path);
+                }
                 try {
                     int buttonState = frame.leftButtonDown == null
                             ? MouseGestureStateMachine.BUTTON_UNCHANGED
