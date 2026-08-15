@@ -180,12 +180,39 @@ public class MouseInputUserService extends IMouseInputService.Stub {
             String preferredDeviceName,
             IMouseEventListener statusListener) {
         try {
-            return InputDeviceDiscovery.discover(
+            InputDeviceDiscovery.Result result = InputDeviceDiscovery.discover(
                     new FileReader("/proc/bus/input/devices"),
                     preferredDeviceName);
+            if (result != null) return result;
+            sendStatus(statusListener, "/proc inventory did not identify the mouse; trying getevent inventory.");
         } catch (Throwable t) {
-            sendStatus(statusListener, "Device discovery error: " + t.getMessage());
+            sendStatus(statusListener, "/proc discovery unavailable; trying getevent inventory: " + t.getMessage());
+        }
+
+        java.lang.Process process = null;
+        try {
+            process = new ProcessBuilder("/system/bin/getevent", "-pl")
+                    .redirectErrorStream(true)
+                    .start();
+            InputDeviceDiscovery.Result result;
+            try (InputStreamReader output = new InputStreamReader(process.getInputStream())) {
+                result = InputDeviceDiscovery.discoverGeteventInventory(
+                        output,
+                        preferredDeviceName);
+            }
+            int exitCode = process.waitFor();
+            if (result == null) {
+                sendStatus(statusListener, "getevent inventory found no matching mouse (exit " + exitCode + ").");
+            }
+            return result;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return null;
+        } catch (Throwable t) {
+            sendStatus(statusListener, "getevent inventory error: " + t.getMessage());
+            return null;
+        } finally {
+            if (process != null) process.destroy();
         }
     }
 

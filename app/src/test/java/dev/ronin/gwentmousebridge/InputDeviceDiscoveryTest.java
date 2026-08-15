@@ -39,6 +39,35 @@ public class InputDeviceDiscoveryTest {
         assertEquals("/dev/input/event14", result.path);
     }
 
+    @Test
+    public void geteventInventoryFindsPreferredHuaweiMouse() throws Exception {
+        String inventory = "add device 1: /dev/input/event5\n"
+                + "  name:     \"Other USB Mouse\"\n"
+                + "  events:\n"
+                + "    REL (0002): REL_X REL_Y\n"
+                + "add device 2: /dev/input/event14\n"
+                + "  name:     \"" + NAME + "\"\n"
+                + "  events:\n"
+                + "    KEY (0001): BTN_MOUSE\n"
+                + "    REL (0002): REL_X REL_Y\n";
+
+        InputDeviceDiscovery.Result result = InputDeviceDiscovery.discoverGeteventInventory(
+                new StringReader(inventory),
+                NAME);
+        assertEquals(NAME, result.name);
+        assertEquals("/dev/input/event14", result.path);
+    }
+
+    @Test
+    public void geteventInventoryFollowsRenumberedPreferredMouse() throws Exception {
+        String inventory = "add device 7: /dev/input/event17\n"
+                + "  name: \"" + NAME + "\"\n";
+        InputDeviceDiscovery.Result result = InputDeviceDiscovery.discoverGeteventInventory(
+                new StringReader(inventory),
+                NAME);
+        assertEquals("/dev/input/event17", result.path);
+    }
+
     private static InputDeviceDiscovery.Result discover(String snapshot) throws Exception {
         return InputDeviceDiscovery.discover(new StringReader(snapshot), NAME);
     }

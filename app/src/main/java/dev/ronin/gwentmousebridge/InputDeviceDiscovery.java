@@ -46,11 +46,35 @@ final class InputDeviceDiscovery {
             addCandidate(candidates, currentName, currentHandlers, preferred);
         }
 
-        Candidate best = null;
-        for (Candidate candidate : candidates) {
-            if (best == null || candidate.score > best.score) best = candidate;
+        return bestResult(candidates);
+    }
+
+    /** Fallback parser for the finite device inventory printed by getevent -pl. */
+    static Result discoverGeteventInventory(Reader source, String preferredDeviceName)
+            throws IOException {
+        String preferred = preferredDeviceName == null ? "" : preferredDeviceName.trim();
+        List<Candidate> candidates = new ArrayList<>();
+
+        try (BufferedReader reader = source instanceof BufferedReader
+                ? (BufferedReader) source
+                : new BufferedReader(source)) {
+            String line;
+            String currentName = null;
+            String currentPath = null;
+            while ((line = reader.readLine()) != null) {
+                String trimmed = line.trim();
+                if (trimmed.startsWith("add device ")) {
+                    addInventoryCandidate(candidates, currentName, currentPath, preferred);
+                    currentName = null;
+                    currentPath = eventPath(trimmed);
+                } else if (trimmed.startsWith("name:")) {
+                    currentName = unquote(trimmed.substring("name:".length()).trim());
+                }
+            }
+            addInventoryCandidate(candidates, currentName, currentPath, preferred);
         }
-        return best == null ? null : new Result(best.name, best.path);
+
+        return bestResult(candidates);
     }
 
     private static void addCandidate(
@@ -74,6 +98,37 @@ final class InputDeviceDiscovery {
         else if (mouseHandler) score = 1;
 
         if (score > 0) candidates.add(new Candidate(name, path, score));
+    }
+
+    private static void addInventoryCandidate(
+            List<Candidate> candidates,
+            String name,
+            String path,
+            String preferred) {
+        if (name == null || path == null) return;
+        boolean exactPreferred = !preferred.isEmpty() && name.equalsIgnoreCase(preferred);
+        String lowerName = name.toLowerCase(Locale.US);
+        boolean mouseLikeName = lowerName.contains("mouse") || lowerName.contains("pointer");
+        int score = exactPreferred ? 4 : mouseLikeName ? 2 : 0;
+        if (score > 0) candidates.add(new Candidate(name, path, score));
+    }
+
+    private static Result bestResult(List<Candidate> candidates) {
+        Candidate best = null;
+        for (Candidate candidate : candidates) {
+            if (best == null || candidate.score > best.score) best = candidate;
+        }
+        return best == null ? null : new Result(best.name, best.path);
+    }
+
+    private static String eventPath(String line) {
+        String prefix = "/dev/input/event";
+        int start = line.indexOf(prefix);
+        if (start < 0) return null;
+        int end = start + prefix.length();
+        while (end < line.length() && Character.isDigit(line.charAt(end))) end++;
+        if (end == start + prefix.length()) return null;
+        return line.substring(start, end);
     }
 
     private static String eventHandler(String handlers) {
