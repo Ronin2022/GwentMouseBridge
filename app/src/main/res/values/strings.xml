@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Gwent Mouse Bridge</string>
+    <string name="accessibility_service_label">Gwent Mouse Bridge</string>
+    <string name="accessibility_description">Converts physical mouse left-click and drag input into touch gestures only while GWENT is in the foreground.</string>
+    <string name="status_waiting">Waiting for setup</string>
+    <string name="request_shizuku">Grant Shizuku access</string>
+    <string name="open_accessibility">Open accessibility settings</string>
+    <string name="bridge_enabled">Enable bridge</string>
+    <string name="show_cursor">Show bridge cursor</string>
+    <string name="sensitivity">Pointer sensitivity</string>
+    <string name="instructions">1. Start Shizuku.\n2. Grant this app Shizuku access.\n3. Enable Gwent Mouse Bridge in Accessibility settings.\n4. Enable the bridge below, then launch GWENT.\n\nThe bridge injects gestures only while com.cdprojektred.gwent is foreground.</string>
+</resources>

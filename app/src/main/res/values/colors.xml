@@ -1,0 +1,4 @@
+<resources>
+    <color name="cursor_fill">#CCFFFFFF</color>
+    <color name="cursor_stroke">#E6000000</color>
+</resources>
