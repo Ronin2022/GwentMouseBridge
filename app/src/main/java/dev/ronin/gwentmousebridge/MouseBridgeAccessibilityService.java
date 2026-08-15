@@ -27,7 +27,8 @@ import rikka.shizuku.Shizuku;
 public class MouseBridgeAccessibilityService extends AccessibilityService implements SharedPreferences.OnSharedPreferenceChangeListener {
     private static final String TAG = "GwentMouseBridge";
     private static final int SHELL_UID = 2000;
-    private static final long SEGMENT_MS = 18L;
+    private static final long TAP_MS = 48L;
+    private static final long DRAG_SEGMENT_MS = 32L;
     private static final long DIAGNOSTIC_WRITE_INTERVAL_MS = 750L;
     private static final int CURSOR_SIZE_DP = 28;
 
@@ -51,6 +52,8 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
     private boolean gestureInFlight;
     private boolean releaseRequested;
     private GestureDescription.StrokeDescription activeStroke;
+    private float pressX;
+    private float pressY;
     private float strokeEndX;
     private float strokeEndY;
     private float pendingX;
@@ -246,11 +249,12 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
         float frameStartX = cursor.x();
         float frameStartY = cursor.y();
-        boolean moved = dx != 0 || dy != 0;
-        if (moved) {
+        boolean rawMoved = dx != 0 || dy != 0;
+        if (rawMoved) {
             cursor.move(dx, dy, BridgePrefs.sensitivity(this));
             updateCursorPosition();
         }
+        boolean moved = cursor.x() != frameStartX || cursor.y() != frameStartY;
 
         List<MouseGestureStateMachine.Action> actions = mouseState.onFrame(
                 moved,
@@ -259,16 +263,24 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         for (MouseGestureStateMachine.Action action : actions) {
             switch (action) {
                 case PRESS:
+                    if (gestureInFlight || activeStroke != null) {
+                        recordGestureStatus("Press ignored: previous gesture still active");
+                        resetGestureState();
+                        break;
+                    }
                     leftDown = true;
                     releaseRequested = false;
                     pendingMove = false;
-                    // If button-down and motion share a SYN frame, touch starts at the
-                    // previous pointer position and the frame becomes one drag segment.
-                    beginPress(moved ? frameStartX : cursor.x(), moved ? frameStartY : cursor.y());
+                    // Delay injection until either motion proves this is a drag or button-up
+                    // proves this is a tap. A drag's first stroke still starts at the exact
+                    // physical button-down coordinate.
+                    pressX = moved ? frameStartX : cursor.x();
+                    pressY = moved ? frameStartY : cursor.y();
+                    recordGestureStatus("Left press armed");
                     break;
-                case DRAG_START:
                 case DRAG_UPDATE:
                     if (!leftDown || activeStroke == null) {
+                        recordGestureStatus("Drag update rejected: no active stroke");
                         resetGestureState();
                         break;
                     }
@@ -277,9 +289,28 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                     pendingMove = true;
                     dispatchNextDragSegmentIfPossible();
                     break;
+                case DRAG_START:
+                    if (!leftDown || activeStroke != null || gestureInFlight) {
+                        recordGestureStatus("Drag start rejected: invalid gesture state");
+                        resetGestureState();
+                        break;
+                    }
+                    beginDrag(pressX, pressY, cursor.x(), cursor.y());
+                    break;
                 case TAP:
+                    if (!leftDown || activeStroke != null || gestureInFlight) {
+                        recordGestureStatus("Tap rejected: invalid gesture state");
+                        resetGestureState();
+                        break;
+                    }
+                    leftDown = false;
+                    releaseRequested = false;
+                    pendingMove = false;
+                    dispatchTap(pressX, pressY);
+                    break;
                 case DRAG_END:
                     if (!leftDown || activeStroke == null) {
+                        recordGestureStatus("Drag end rejected: no active stroke");
                         resetGestureState();
                         break;
                     }
@@ -291,6 +322,7 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                     dispatchNextDragSegmentIfPossible();
                     break;
                 case ABORT:
+                    recordGestureStatus("Gesture aborted: GWENT foreground unavailable");
                     stopGestureInteraction();
                     break;
             }
@@ -303,32 +335,60 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
                 || remoteService == null
                 || !isShizukuShellReady()) return false;
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return false;
+        // Surface-based games can transiently expose no accessibility root while remaining
+        // foreground. Keep the last window-event confirmation in that case; an available root
+        // is still authoritative and can immediately fail the guard closed.
+        if (root == null) return true;
         try {
             CharSequence pkg = root.getPackageName();
-            return pkg != null && BridgePrefs.GWENT_PACKAGE.contentEquals(pkg);
+            boolean rootIsGwent = pkg != null && BridgePrefs.GWENT_PACKAGE.contentEquals(pkg);
+            if (!rootIsGwent) setGwentForeground(false);
+            return rootIsGwent;
         } finally {
             root.recycle();
         }
     }
 
-    private void beginPress(float x, float y) {
-        if (gestureInFlight || activeStroke != null) {
-            stopInteraction();
-            return;
-        }
+    private void dispatchTap(float x, float y) {
         Path path = new Path();
         path.moveTo(x, y);
-        GestureDescription.StrokeDescription stroke = new GestureDescription.StrokeDescription(path, 0, SEGMENT_MS, true);
-        activeStroke = stroke;
-        strokeEndX = x;
-        strokeEndY = y;
+        GestureDescription.StrokeDescription stroke =
+                new GestureDescription.StrokeDescription(path, 0, TAP_MS, false);
         gestureInFlight = true;
+        recordGestureStatus("Tap dispatched");
+        boolean accepted = dispatchStroke(stroke, () -> {
+            recordGestureStatus("Tap completed");
+            resetGestureState();
+        });
+        if (!accepted) {
+            recordGestureStatus("Tap dispatch rejected");
+            resetGestureState();
+        }
+    }
+
+    private void beginDrag(float startX, float startY, float endX, float endY) {
+        Path path = new Path();
+        path.moveTo(startX, startY);
+        path.lineTo(endX, endY);
+        GestureDescription.StrokeDescription stroke = new GestureDescription.StrokeDescription(
+                path,
+                0,
+                DRAG_SEGMENT_MS,
+                true);
+        activeStroke = stroke;
+        strokeEndX = endX;
+        strokeEndY = endY;
+        gestureInFlight = true;
+        recordGestureStatus("Drag start dispatched");
         boolean accepted = dispatchStroke(stroke, () -> {
             gestureInFlight = false;
+            recordGestureStatus("Drag active");
             dispatchNextDragSegmentIfPossible();
         });
-        if (!accepted) resetGestureState();
+        if (!accepted) {
+            recordGestureStatus("Drag start dispatch rejected");
+            resetGestureState();
+        }
     }
 
     private void dispatchNextDragSegmentIfPossible() {
@@ -358,8 +418,9 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
 
         GestureDescription.StrokeDescription next;
         try {
-            next = activeStroke.continueStroke(path, 0, SEGMENT_MS, willContinue);
+            next = activeStroke.continueStroke(path, 0, DRAG_SEGMENT_MS, willContinue);
         } catch (Throwable t) {
+            recordGestureStatus("Drag continuation failed: " + safeMessage(t));
             resetGestureState();
             return;
         }
@@ -371,12 +432,16 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         boolean accepted = dispatchStroke(next, () -> {
             gestureInFlight = false;
             if (!willContinue) {
+                recordGestureStatus("Drag completed");
                 resetGestureState();
             } else {
                 dispatchNextDragSegmentIfPossible();
             }
         });
-        if (!accepted) resetGestureState();
+        if (!accepted) {
+            recordGestureStatus("Drag continuation dispatch rejected");
+            resetGestureState();
+        }
     }
 
     private boolean dispatchStroke(GestureDescription.StrokeDescription stroke, Runnable completed) {
@@ -385,12 +450,15 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
             return dispatchGesture(gesture, new GestureResultCallback() {
                 @Override
                 public void onCompleted(GestureDescription gestureDescription) {
-                    mainHandler.post(completed);
+                    // The callback already runs on mainHandler. Continue immediately so OEM
+                    // gesture dispatchers do not see an avoidable Looper-turn gap.
+                    completed.run();
                 }
 
                 @Override
                 public void onCancelled(GestureDescription gestureDescription) {
-                    mainHandler.post(MouseBridgeAccessibilityService.this::resetGestureState);
+                    recordGestureStatus("Gesture cancelled by Android");
+                    resetGestureState();
                 }
             }, mainHandler);
         } catch (Throwable t) {
@@ -430,6 +498,22 @@ public class MouseBridgeAccessibilityService extends AccessibilityService implem
         releaseRequested = false;
         pendingMove = false;
         activeStroke = null;
+    }
+
+    private void recordGestureStatus(String status) {
+        if (prefs == null) return;
+        prefs.edit()
+                .putString(
+                        BridgePrefs.KEY_GESTURE_STATUS,
+                        status == null ? "Unknown gesture state" : status)
+                .apply();
+    }
+
+    private static String safeMessage(Throwable throwable) {
+        String message = throwable == null ? null : throwable.getMessage();
+        return message == null || message.isEmpty()
+                ? (throwable == null ? "unknown" : throwable.getClass().getSimpleName())
+                : message;
     }
 
     private void updateScreenBounds(boolean recenter) {

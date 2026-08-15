@@ -34,7 +34,9 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
             (sharedPreferences, key) -> {
-                if (key != null && key.startsWith("reader_")) refreshStatus();
+                if (key != null && (key.startsWith("reader_") || key.startsWith("gesture_"))) {
+                    refreshStatus();
+                }
             };
 
     private final Shizuku.OnBinderReceivedListener binderReceivedListener = this::refreshStatus;
@@ -151,6 +153,9 @@ public class MainActivity extends Activity {
             String readerStatus = prefs.getString(
                     BridgePrefs.KEY_READER_STATUS,
                     "No reader status yet");
+            String gestureStatus = prefs.getString(
+                    BridgePrefs.KEY_GESTURE_STATUS,
+                    "No gesture attempted yet");
             long frames = prefs.getLong(BridgePrefs.KEY_READER_FRAME_COUNT, 0L);
             long motionFrames = prefs.getLong(BridgePrefs.KEY_READER_MOTION_FRAME_COUNT, 0L);
             long lastFrameTime = prefs.getLong(BridgePrefs.KEY_READER_LAST_FRAME_TIME, 0L);
@@ -164,6 +169,7 @@ public class MainActivity extends Activity {
                     + "\nReader: " + readerStatus
                     + "\nFrames: " + frames + " total / " + motionFrames + " motion"
                     + "\nLast frame: " + lastFrame
+                    + "\nGesture: " + gestureStatus
                     + "\nTarget: " + BridgePrefs.GWENT_PACKAGE;
             statusText.setText(text);
         });
